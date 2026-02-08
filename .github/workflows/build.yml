@@ -9,7 +9,7 @@ env:
   PYTHON_VERSION: "3.14.3"
   ANDROID_API: "21"
   ANDROID_ARCH: "arm64"
-  TARGET_TRIPLE: "aarch64-linux-android"
+  TARGET: "aarch64-linux-android"
   PREFIX: "/opt/python-android"
 
 jobs:
@@ -45,31 +45,41 @@ jobs:
           key: ndk-r26d-${{ runner.os }}-${{ env.ANDROID_ARCH }}
 
       # ---------------------------
-      # Setup ENV + directories
+      # Prepare environment (set paths for next steps)
       # ---------------------------
       - name: Prepare environment
         run: |
+          # export runner paths for later steps via GITHUB_ENV
           echo "NDK_DIR=$HOME/android-ndk" >> $GITHUB_ENV
           echo "TOOLCHAIN_DIR=$HOME/android-ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
           echo "SYSROOT=$HOME/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
-          echo "TARGET=${TARGET_TRIPLE}" >> $GITHUB_ENV
-          echo "API=${ANDROID_API}" >> $GITHUB_ENV
+          echo "TARGET=${{ env.TARGET }}" >> $GITHUB_ENV
+          echo "API=${{ env.ANDROID_API }}" >> $GITHUB_ENV
 
           mkdir -p "$GITHUB_WORKSPACE/build-deps/openssl-install"
           mkdir -p "$GITHUB_WORKSPACE/build-deps/libffi-install"
           mkdir -p "$GITHUB_WORKSPACE/build-deps/zlib-install"
 
       # ---------------------------
-      # Download NDK
+      # Download NDK (only if not cached)
       # ---------------------------
-      - name: Download NDK
+      - name: Download NDK (if cache miss)
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-          unzip -q android-ndk-r26d-linux.zip
+          ZIP=android-ndk-r26d-linux.zip
+          if [ ! -f "$ZIP" ]; then
+            echo "Downloading NDK..."
+            wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -O "$ZIP"
+          else
+            echo "NDK zip already present: $ZIP"
+          fi
+          rm -rf android-ndk-r26d
+          unzip -q "$ZIP"
           mkdir -p "$HOME/android-ndk"
-          mv android-ndk-r26d/* "$HOME/android-ndk/"
+          mv -f android-ndk-r26d/* "$HOME/android-ndk/" || true
+          echo "NDK installed to $HOME/android-ndk"
+          ls -la "$HOME/android-ndk" | head -n 40
 
       # ---------------------------
       # Cache Python source
@@ -79,86 +89,144 @@ jobs:
         uses: actions/cache@v4
         with:
           path: Python-${{ env.PYTHON_VERSION }}
-          key: python-src-${{ env.PYTHON_VERSION }}
+          key: python-src-${{ env.PYTHON_VERSION }}-${{ runner.os }}
 
-      - name: Download Python source
+      - name: Download Python source (if cache miss)
         if: steps.cache-python-src.outputs.cache-hit != 'true'
         run: |
-          wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz
-          tar -xzf Python-${PYTHON_VERSION}.tgz
+          set -euo pipefail
+          TAR=Python-${PYTHON_VERSION}.tgz
+          if [ ! -f "$TAR" ]; then
+            echo "Downloading Python source $TAR..."
+            wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/$TAR -O $TAR
+          else
+            echo "Python source tar exists: $TAR"
+          fi
+          if [ ! -d "Python-${PYTHON_VERSION}" ]; then
+            tar -xzf $TAR
+          fi
+          ls -la "Python-${PYTHON_VERSION}" | head -n 40
 
       # ---------------------------
-      # Build zlib
+      # Build zlib (robust download/extract)
       # ---------------------------
-      - name: Build zlib
+      - name: Build zlib (aarch64)
+        env:
+          TOOLCHAIN_DIR: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64
+          TARGET: ${{ env.TARGET }}
+          API: ${{ env.ANDROID_API }}
         run: |
           set -euo pipefail
           ZVER=1.2.13
+          TAR=zlib-${ZVER}.tar.gz
+          DIR=zlib-${ZVER}
           cd "$GITHUB_WORKSPACE"
-
-          wget -q https://zlib.net/zlib-$ZVER.tar.gz || true
-          tar -xf zlib-$ZVER.tar.gz || true
-
-          cd zlib-$ZVER
+          if [ ! -f "$TAR" ]; then
+            echo "Downloading $TAR..."
+            wget -q https://zlib.net/$TAR -O $TAR
+          else
+            echo "$TAR already exists"
+          fi
+          if [ ! -f "$TAR" ]; then
+            echo "ERROR: failed to download $TAR"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+          # extract
+          if [ ! -d "$DIR" ]; then
+            tar -xzf "$TAR"
+          fi
+          if [ ! -d "$DIR" ]; then
+            echo "ERROR: extracted dir $DIR missing"
+            exit 1
+          fi
+          cd "$DIR"
           export CC="$TOOLCHAIN_DIR/bin/${TARGET}${API}-clang"
           export AR="$TOOLCHAIN_DIR/bin/llvm-ar"
-
+          echo "Configure zlib with CC=$CC"
           ./configure --static --prefix="$GITHUB_WORKSPACE/build-deps/zlib-install"
           make -j$(nproc)
           make install
+          echo "zlib installed to $GITHUB_WORKSPACE/build-deps/zlib-install"
 
       # ---------------------------
-      # Build libffi
+      # Build libffi (robust)
       # ---------------------------
-      - name: Build libffi
+      - name: Build libffi (aarch64)
+        env:
+          TOOLCHAIN_DIR: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64
+          TARGET: ${{ env.TARGET }}
+          API: ${{ env.ANDROID_API }}
         run: |
           set -euo pipefail
           VER=3.4.4
+          TAR=libffi-${VER}.tar.gz
+          DIR=libffi-${VER}
           cd "$GITHUB_WORKSPACE"
-
-          wget -q https://github.com/libffi/libffi/releases/download/v$VER/libffi-$VER.tar.gz || true
-          tar -xf libffi-$VER.tar.gz || true
-
-          cd libffi-$VER
+          if [ ! -f "$TAR" ]; then
+            echo "Downloading $TAR..."
+            wget -q https://github.com/libffi/libffi/releases/download/v${VER}/$TAR -O $TAR
+          fi
+          if [ ! -f "$TAR" ]; then
+            echo "ERROR: failed to download $TAR"
+            exit 1
+          fi
+          if [ ! -d "$DIR" ]; then
+            tar -xzf $TAR
+          fi
+          cd "$DIR"
           export CC="$TOOLCHAIN_DIR/bin/${TARGET}${API}-clang"
-
-          ./configure --host=$TARGET \
-            --disable-shared \
-            --prefix="$GITHUB_WORKSPACE/build-deps/libffi-install"
-
+          export AR="$TOOLCHAIN_DIR/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN_DIR/bin/llvm-ranlib"
+          ./configure --host=${TARGET} --disable-shared --prefix="$GITHUB_WORKSPACE/build-deps/libffi-install"
           make -j$(nproc)
           make install
+          echo "libffi installed to $GITHUB_WORKSPACE/build-deps/libffi-install"
 
       # ---------------------------
-      # Build OpenSSL
+      # Build OpenSSL (robust)
       # ---------------------------
-      - name: Build OpenSSL
+      - name: Build OpenSSL (aarch64)
+        env:
+          TOOLCHAIN_DIR: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64
         run: |
           set -euo pipefail
           VER=3.1.5
+          TAR=openssl-${VER}.tar.gz
+          DIR=openssl-${VER}
           cd "$GITHUB_WORKSPACE"
-
-          wget -q https://www.openssl.org/source/openssl-$VER.tar.gz || true
-          tar -xf openssl-$VER.tar.gz || true
-
-          cd openssl-$VER
-          export ANDROID_NDK_HOME="$NDK_DIR"
-
-          ./Configure android64-aarch64 \
-            no-ssl2 no-ssl3 no-comp \
-            --prefix="$GITHUB_WORKSPACE/build-deps/openssl-install"
-
+          if [ ! -f "$TAR" ]; then
+            echo "Downloading $TAR..."
+            wget -q https://www.openssl.org/source/$TAR -O $TAR
+          fi
+          if [ ! -f "$TAR" ]; then
+            echo "ERROR: failed to download $TAR"
+            exit 1
+          fi
+          if [ ! -d "$DIR" ]; then
+            tar -xzf $TAR
+          fi
+          cd "$DIR"
+          export ANDROID_NDK_HOME="$HOME/android-ndk"
+          export PATH="/usr/bin:$PATH"
+          perl -v >/dev/null 2>&1 || { echo "perl missing"; exit 1; }
+          ./Configure android64-aarch64 no-ssl2 no-ssl3 no-comp --prefix="$GITHUB_WORKSPACE/build-deps/openssl-install"
           make -j$(nproc)
           make install_sw
+          echo "OpenSSL installed to $GITHUB_WORKSPACE/build-deps/openssl-install"
 
       # ---------------------------
-      # Configure Python
+      # Configure Python (cross)
       # ---------------------------
       - name: Configure Python
+        env:
+          TOOLCHAIN_DIR: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64
+          SYSROOT: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          TARGET: ${{ env.TARGET }}
+          API: ${{ env.ANDROID_API }}
         run: |
           set -euo pipefail
-          cd Python-${PYTHON_VERSION}
-
+          cd "Python-${PYTHON_VERSION}"
           export CC="ccache $TOOLCHAIN_DIR/bin/${TARGET}${API}-clang"
           export CXX="ccache $TOOLCHAIN_DIR/bin/${TARGET}${API}-clang++"
           export AR="$TOOLCHAIN_DIR/bin/llvm-ar"
@@ -166,24 +234,23 @@ jobs:
           export STRIP="$TOOLCHAIN_DIR/bin/llvm-strip"
           export LD="$TOOLCHAIN_DIR/bin/ld.lld"
 
-          export CPPFLAGS="-I$GITHUB_WORKSPACE/build-deps/zlib-install/include \
-          -I$GITHUB_WORKSPACE/build-deps/libffi-install/include \
-          -I$GITHUB_WORKSPACE/build-deps/openssl-install/include"
-
-          export LDFLAGS="-L$GITHUB_WORKSPACE/build-deps/zlib-install/lib \
-          -L$GITHUB_WORKSPACE/build-deps/libffi-install/lib \
-          -L$GITHUB_WORKSPACE/build-deps/openssl-install/lib \
-          --sysroot=$SYSROOT"
+          export CPPFLAGS="-I$GITHUB_WORKSPACE/build-deps/zlib-install/include -I$GITHUB_WORKSPACE/build-deps/libffi-install/include -I$GITHUB_WORKSPACE/build-deps/openssl-install/include"
+          export LDFLAGS="-L$GITHUB_WORKSPACE/build-deps/zlib-install/lib -L$GITHUB_WORKSPACE/build-deps/libffi-install/lib -L$GITHUB_WORKSPACE/build-deps/openssl-install/lib --sysroot=$SYSROOT"
 
           BUILD_PYTHON=$(which python3)
+          if [ -z "$BUILD_PYTHON" ]; then
+            echo "ERROR: python3 not found on runner"
+            exit 1
+          fi
+          echo "Using build-python: $BUILD_PYTHON"
 
           ./configure \
-            --host=$TARGET \
+            --host=${TARGET} \
             --build=$(./config.guess) \
-            --with-build-python=$BUILD_PYTHON \
+            --with-build-python=${BUILD_PYTHON} \
             --enable-shared \
             --with-ensurepip=install \
-            --prefix=$PREFIX \
+            --prefix=${PREFIX} \
             ac_cv_file__dev_ptmx=yes \
             ac_cv_file__dev_ptc=no \
             ac_cv_func_getentropy=no
@@ -194,26 +261,30 @@ jobs:
       - name: Build Python
         run: |
           set -euo pipefail
-          cd Python-${PYTHON_VERSION}
-
-          make -j$(nproc)
+          cd "Python-${PYTHON_VERSION}"
+          MAKEFLAGS=-j$(nproc) make
           make install DESTDIR=$PWD/install
 
       # ---------------------------
       # Package
       # ---------------------------
-      - name: Package
+      - name: Package artifact
         run: |
           set -euo pipefail
-          cd Python-${PYTHON_VERSION}/install
-
+          cd "Python-${PYTHON_VERSION}/install"
           ARCHIVE=python-${PYTHON_VERSION}-android-${ANDROID_ARCH}.tar.gz
-          tar -czf $ARCHIVE ./*
+          tar -czf "$ARCHIVE" ./*
+          mv "$ARCHIVE" "$GITHUB_WORKSPACE/"
 
-          mv $ARCHIVE $GITHUB_WORKSPACE/
+      - name: Create sha256
+        run: |
+          set -euo pipefail
+          sha256sum python-${PYTHON_VERSION}-android-${ANDROID_ARCH}.tar.gz > python-${PYTHON_VERSION}-android-${ANDROID_ARCH}.sha256
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: python-android-${{ env.ANDROID_ARCH }}
-          path: python-${{ env.PYTHON_VERSION }}-android-${{ env.ANDROID_ARCH }}.tar.gz
+          path: |
+            python-${{ env.PYTHON_VERSION }}-android-${{ env.ANDROID_ARCH }}.tar.gz
+            python-${{ env.PYTHON_VERSION }}-android-${{ env.ANDROID_ARCH }}.sha256
