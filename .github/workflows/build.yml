@@ -17,6 +17,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
+    # === job-level env (declared once, available in every step) ===
+    env:
+      NDK_DIR: ${{ env.HOME }}/android-ndk
+      TOOLCHAIN_DIR: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64
+      SYSROOT: ${{ env.HOME }}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+      TARGET: aarch64-linux-android
+      API: "21"
+      ANDROID_ARCH: "arm64"
+      PREFIX: "/opt/python-android"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,24 +41,31 @@ jobs:
             pkg-config autoconf automake libtool ccache perl rsync file binutils
 
       # ---------------------------
-      # Cache NDK (key includes runner.os)
+      # Cache NDK (key includes runner.os + arch)
       # ---------------------------
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
         with:
-          path: ~/android-ndk
-          key: ndk-r26d-${{ runner.os }}
+          path: ${{ env.NDK_DIR }}
+          key: ndk-r26d-${{ runner.os }}-${{ env.ANDROID_ARCH }}
 
       - name: Download and unpack NDK (if cache missed)
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
+          # download if missing
           if [ ! -f android-ndk-r26d-linux.zip ]; then
             wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           fi
+          # unpack to a temp folder and move into NDK_DIR
+          rm -rf android-ndk-r26d
           unzip -q android-ndk-r26d-linux.zip
-          mv -f android-ndk-r26d ~/android-ndk
+          mkdir -p "${NDK_DIR}"
+          # move contents of extracted folder into our NDK_DIR
+          mv -f android-ndk-r26d/* "${NDK_DIR}/"
+          # quick sanity
+          ls -la "${NDK_DIR}" || true
 
       # ---------------------------
       # Cache Python source (by folder)
@@ -64,12 +81,13 @@ jobs:
         if: steps.cache-python-src.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          if [ ! -f Python-${PYTHON_VERSION}.tgz ]; then
+          if [ ! -f "Python-${PYTHON_VERSION}.tgz" ]; then
             wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz
           fi
           if [ ! -d "Python-${PYTHON_VERSION}" ]; then
             tar -xzf Python-${PYTHON_VERSION}.tgz
           fi
+          ls -la "Python-${PYTHON_VERSION}" || true
 
       # ---------------------------
       # Cache ccache
@@ -81,27 +99,21 @@ jobs:
           key: ccache-${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-${{ env.ANDROID_ARCH }}
 
       # ---------------------------
-      # Prepare dirs & env (safe defaults)
+      # Prepare build-deps dirs (no GITHUB_ENV hack)
       # ---------------------------
-      - name: Prepare dirs & env
+      - name: Prepare dirs & sanity
         run: |
           set -euo pipefail
-          # set safe fallbacks if GITHUB_ENV not populated yet
-          export NDK_DIR="${HOME}/android-ndk"
-          export TOOLCHAIN_DIR="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64"
-          export SYSROOT="${TOOLCHAIN_DIR}/sysroot"
-          echo "NDK_DIR=${NDK_DIR}" >> $GITHUB_ENV
-          echo "TOOLCHAIN_DIR=${TOOLCHAIN_DIR}" >> $GITHUB_ENV
-          echo "SYSROOT=${SYSROOT}" >> $GITHUB_ENV
-          echo "TARGET=${{ env.TARGET_TRIPLE }}" >> $GITHUB_ENV
-          echo "API=${{ env.ANDROID_API }}" >> $GITHUB_ENV
-          mkdir -p "$GITHUB_WORKSPACE/build-deps"
           mkdir -p "$GITHUB_WORKSPACE/build-deps/openssl-install"
           mkdir -p "$GITHUB_WORKSPACE/build-deps/libffi-install"
           mkdir -p "$GITHUB_WORKSPACE/build-deps/zlib-install"
-          # quick sanity
+          echo "NDK_DIR=${NDK_DIR}"
           echo "TOOLCHAIN_DIR=${TOOLCHAIN_DIR}"
-          ls -la "${TOOLCHAIN_DIR}" || true
+          if [ ! -d "${TOOLCHAIN_DIR}" ]; then
+            echo "NOTE: TOOLCHAIN_DIR does not exist yet (NDK may be unpacked later)."
+          else
+            ls -la "${TOOLCHAIN_DIR}" | head -n 20 || true
+          fi
 
       # ---------------------------
       # Build zlib for Android (target) - guarded
@@ -118,11 +130,6 @@ jobs:
             tar -xzf zlib-${ZVER}.tar.gz
           fi
           cd zlib-${ZVER}
-          # fallback to env or constructed path
-          TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$HOME/android-ndk/toolchains/llvm/prebuilt/linux-x86_64}"
-          SYSROOT="${SYSROOT:-$TOOLCHAIN_DIR/sysroot}"
-          API="${API:-${{ env.ANDROID_API }}}"
-          TARGET="${TARGET:-${{ env.TARGET_TRIPLE }}}"
           export CC="${TOOLCHAIN_DIR}/bin/${TARGET}${API}-clang"
           export AR="${TOOLCHAIN_DIR}/bin/llvm-ar"
           ./configure --prefix="$GITHUB_WORKSPACE/build-deps/zlib-install" --static
@@ -130,7 +137,7 @@ jobs:
           make install
 
       # ---------------------------
-      # Build libffi for Android (target) - guarded
+      # Build libffi for Android (target)
       # ---------------------------
       - name: Build libffi (aarch64)
         run: |
@@ -144,9 +151,6 @@ jobs:
             tar -xzf libffi-${LIBFFI_VER}.tar.gz
           fi
           cd libffi-${LIBFFI_VER}
-          TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$HOME/android-ndk/toolchains/llvm/prebuilt/linux-x86_64}"
-          API="${API:-${{ env.ANDROID_API }}}"
-          TARGET="${TARGET:-${{ env.TARGET_TRIPLE }}}"
           export CC="${TOOLCHAIN_DIR}/bin/${TARGET}${API}-clang"
           export AR="${TOOLCHAIN_DIR}/bin/llvm-ar"
           export RANLIB="${TOOLCHAIN_DIR}/bin/llvm-ranlib"
@@ -155,7 +159,7 @@ jobs:
           make install
 
       # ---------------------------
-      # Build OpenSSL for Android (aarch64) - guarded
+      # Build OpenSSL for Android (aarch64)
       # ---------------------------
       - name: Build OpenSSL (aarch64)
         run: |
@@ -169,9 +173,8 @@ jobs:
             tar -xzf openssl-${OPENSSL_VER}.tar.gz
           fi
           cd openssl-${OPENSSL_VER}
-          export ANDROID_NDK_HOME="${HOME}/android-ndk"
+          export ANDROID_NDK_HOME="${NDK_DIR}"
           export PATH="/usr/bin:$PATH"
-          # ensure perl exists
           perl -v >/dev/null 2>&1 || { echo "perl missing"; exit 1; }
           ./Configure android64-aarch64 shared no-ssl2 no-ssl3 no-comp --prefix="$GITHUB_WORKSPACE/build-deps/openssl-install"
           make -j$(nproc)
@@ -186,7 +189,7 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/build-deps/zlib-install" || true
 
       # ---------------------------
-      # Configure Python (cross) - guarded with checks
+      # Configure Python (cross)
       # ---------------------------
       - name: Configure Python (cross)
         shell: bash
@@ -194,37 +197,30 @@ jobs:
           PATH: /usr/lib/ccache:$PATH
         run: |
           set -euo pipefail
-          # sanity checks for required env and dirs
-          G_TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-${HOME}/android-ndk/toolchains/llvm/prebuilt/linux-x86_64}"
-          G_SYSROOT="${SYSROOT:-${G_TOOLCHAIN_DIR}/sysroot}"
-          G_TARGET="${TARGET_TRIPLE:-aarch64-linux-android}"
-          G_API="${ANDROID_API:-21}"
-
-          echo "Using TOOLCHAIN_DIR=$G_TOOLCHAIN_DIR"
-          if [ ! -d "$G_TOOLCHAIN_DIR" ]; then
-            echo "ERROR: TOOLCHAIN_DIR not found: $G_TOOLCHAIN_DIR"
-            ls -la "${HOME}/android-ndk" || true
+          # sanity checks
+          if [ ! -d "${TOOLCHAIN_DIR}" ]; then
+            echo "ERROR: toolchain dir not found: ${TOOLCHAIN_DIR}"
+            ls -la "${NDK_DIR}" || true
             exit 1
           fi
           if [ ! -d "Python-${PYTHON_VERSION}" ]; then
-            echo "ERROR: Python source dir Python-${PYTHON_VERSION} not found"
+            echo "ERROR: Python source missing"
             exit 1
           fi
 
           cd "Python-${PYTHON_VERSION}"
 
-          export AR="${G_TOOLCHAIN_DIR}/bin/llvm-ar"
-          export RANLIB="${G_TOOLCHAIN_DIR}/bin/llvm-ranlib"
-          export STRIP="${G_TOOLCHAIN_DIR}/bin/llvm-strip"
-          export CC="ccache ${G_TOOLCHAIN_DIR}/bin/${G_TARGET}${G_API}-clang"
-          export CXX="ccache ${G_TOOLCHAIN_DIR}/bin/${G_TARGET}${G_API}-clang++"
-          export LD="${G_TOOLCHAIN_DIR}/bin/ld.lld"
+          export AR="${TOOLCHAIN_DIR}/bin/llvm-ar"
+          export RANLIB="${TOOLCHAIN_DIR}/bin/llvm-ranlib"
+          export STRIP="${TOOLCHAIN_DIR}/bin/llvm-strip"
+          export CC="ccache ${TOOLCHAIN_DIR}/bin/${TARGET}${API}-clang"
+          export CXX="ccache ${TOOLCHAIN_DIR}/bin/${TARGET}${API}-clang++"
+          export LD="${TOOLCHAIN_DIR}/bin/ld.lld"
 
           export CPPFLAGS="-I$GITHUB_WORKSPACE/build-deps/zlib-install/include -I$GITHUB_WORKSPACE/build-deps/libffi-install/include -I$GITHUB_WORKSPACE/build-deps/openssl-install/include"
-          export LDFLAGS="-L$GITHUB_WORKSPACE/build-deps/zlib-install/lib -L$GITHUB_WORKSPACE/build-deps/libffi-install/lib -L$GITHUB_WORKSPACE/build-deps/openssl-install/lib --sysroot=${G_SYSROOT}"
+          export LDFLAGS="-L$GITHUB_WORKSPACE/build-deps/zlib-install/lib -L$GITHUB_WORKSPACE/build-deps/libffi-install/lib -L$GITHUB_WORKSPACE/build-deps/openssl-install/lib --sysroot=${SYSROOT}"
           export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/build-deps/libffi-install/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-          # Use host python as build-python (required for cross compile)
           BUILD_PYTHON=$(which python3 || true)
           if [ -z "${BUILD_PYTHON:-}" ]; then
             echo "ERROR: python3 not found on runner"
@@ -232,9 +228,8 @@ jobs:
           fi
           echo "Using build-python: $BUILD_PYTHON"
 
-          # run configure with build-python set
           ./configure \
-            --host=${G_TARGET} \
+            --host=${TARGET} \
             --build=$(./config.guess) \
             --with-build-python=${BUILD_PYTHON} \
             --enable-shared \
@@ -261,7 +256,6 @@ jobs:
       - name: Strip and package
         run: |
           set -euo pipefail
-          # locate final install folder
           INSTALL_ROOT="Python-${PYTHON_VERSION}/install${PREFIX}"
           if [ ! -d "$INSTALL_ROOT" ]; then
             echo "ERROR: install root not found: $INSTALL_ROOT"
@@ -272,11 +266,11 @@ jobs:
           cd "$INSTALL_ROOT"
           if [ -d bin ]; then
             find bin -type f -exec file {} \; | grep ELF | cut -d: -f1 | while read -r f; do
-              ${G_TOOLCHAIN_DIR:-$HOME/android-ndk/toolchains/llvm/prebuilt/linux-x86_64}/bin/llvm-strip --strip-unneeded "$f" || true
+              ${TOOLCHAIN_DIR}/bin/llvm-strip --strip-unneeded "$f" || true
             done
           fi
           find lib -name "*.so*" -type f 2>/dev/null | while read -r f; do
-            ${G_TOOLCHAIN_DIR:-$HOME/android-ndk/toolchains/llvm/prebuilt/linux-x86_64}/bin/llvm-strip --strip-unneeded "$f" || true
+            ${TOOLCHAIN_DIR}/bin/llvm-strip --strip-unneeded "$f" || true
           done || true
 
           echo "==== ELF summary ===="
